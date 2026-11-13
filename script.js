@@ -1,4 +1,4 @@
-// Referencias a elementos del DOM usando los nombres indicados
+// Referencias a elementos del DOM
 const zonaDeChat = document.getElementById('zona-de-chat');
 const userInput = document.getElementById('user-input');
 const sendBtn = document.getElementById('send-btn');
@@ -6,8 +6,40 @@ const chatForm = document.getElementById('chat-form');
 
 // Variables de estado anti-spam y control de peticiones
 let isSending = false;
-const COOLDOWN_TIME = 2000; // 2 segundos entre envíos
-const TIMEOUT_LIMIT = 10000; // 10 segundos tiempo límite
+const COOLDOWN_TIME = 1500; // 1,5 segundos entre envíos
+const TIMEOUT_LIMIT = 30000; // 30 segundos tiempo límite
+const MAX_CARACTERES = 500;
+
+// Identificador único de sesión
+const sessionId = obtenerSessionId();
+
+/**
+ * Obtiene o genera un identificador de sesión persistente
+ */
+function obtenerSessionId() {
+  const claveStorage = 'promptin_session_id';
+  let idGuardado = null;
+
+  try {
+    idGuardado = localStorage.getItem(claveStorage);
+  } catch (e) {
+    // Almacenamiento no disponible
+  }
+
+  if (idGuardado) return idGuardado;
+
+  const nuevoId = (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function')
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
+
+  try {
+    localStorage.setItem(claveStorage, nuevoId);
+  } catch (e) {
+    // Continuar usando la variable en memoria
+  }
+
+  return nuevoId;
+}
 
 // Auto-ajuste de altura para el textarea
 userInput.addEventListener('input', () => {
@@ -29,6 +61,18 @@ chatForm.addEventListener('submit', (e) => {
 });
 
 /**
+ * Verifica si la URL del webhook está configurada correctamente
+ */
+function webhookConfigurado() {
+  if (typeof WEBHOOK_URL === 'undefined') return false;
+  const url = String(WEBHOOK_URL).trim();
+  if (!url || url.includes('ACA VA') || url.includes('ejemplo-webhook-prueba')) {
+    return false;
+  }
+  return true;
+}
+
+/**
  * Función principal para gestionar el envío de mensajes
  */
 async function enviarMensaje() {
@@ -37,9 +81,20 @@ async function enviarMensaje() {
   // Validaciones previas
   if (!mensaje || isSending) return;
 
+  if (mensaje.length > MAX_CARACTERES) {
+    agregarMensajeAlDOM(`El mensaje supera el límite de ${MAX_CARACTERES} caracteres.`, 'error');
+    return;
+  }
+
+  // Verificar si falta configurar la URL del webhook
+  if (!webhookConfigurado()) {
+    agregarMensajeAlDOM('Falta pegar la URL de tu webhook en config.js', 'error');
+    return;
+  }
+
   // Bloquear interfaz para evitar múltiples envíos
   bloquearInterfaz(true);
-  
+
   // 1. Mostrar mensaje del usuario en la zona de chat
   agregarMensajeAlDOM(mensaje, 'user');
   limpiarInput();
@@ -47,52 +102,50 @@ async function enviarMensaje() {
   // 2. Mostrar estado visual de 'cargando'
   const loadingElement = mostrarIndicadorCarga();
 
-  // 3. Preparar AbortController para timeout
+  // 3. Preparar AbortController para timeout de 30s
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_LIMIT);
 
   try {
-    // Petición asíncrona al Webhook configurado
+    const payload = {
+      sessionId: sessionId,
+      mensaje: mensaje,
+      fecha: new Date().toISOString()
+    };
+
     const response = await fetch(WEBHOOK_URL, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify({ message: mensaje }),
+      body: JSON.stringify(payload),
       signal: controller.signal
     });
 
-    clearTimeout(timeoutId);
+    const textoCrudo = (await response.text()).trim();
 
     if (!response.ok) {
-      throw new Error(`Error en el servidor: ${response.status}`);
+      const errorServidor = new Error(`Make respondió con error (código ${response.status}). Revisá que tu escenario esté en Active o que hayas apretado Run once.`);
+      errorServidor.esErrorServidor = true;
+      throw errorServidor;
     }
 
-    const data = await response.json();
-    
-    // Remover indicador de carga
-    removerElemento(loadingElement);
-
-    // 4. Mostrar respuesta exitosa del agente
-    const respuestaAgente = data.reply || data.message || "Solicitud procesada correctamente.";
-    agregarMensajeAlDOM(respuestaAgente, 'bot');
+    const textoFinal = procesarRespuestaMake(textoCrudo);
+    agregarMensajeAlDOM(textoFinal, 'bot');
 
   } catch (error) {
+    if (error.name === 'AbortError') {
+      agregarMensajeAlDOM('La consulta tardó demasiado tiempo en responder (más de 30 segundos). Intentá nuevamente.', 'error');
+    } else if (error.esErrorServidor) {
+      agregarMensajeAlDOM(error.message, 'error');
+    } else {
+      agregarMensajeAlDOM('No se pudo conectar con el servidor. Revisá tu conexión a internet o la URL en config.js.', 'error');
+    }
+  } finally {
     clearTimeout(timeoutId);
     removerElemento(loadingElement);
 
-    // Manejo de errores visual en el DOM
-    if (error.name === 'AbortError') {
-      agregarMensajeAlDOM("La consulta tardó demasiado tiempo en responder. Intente nuevamente.", 'error');
-    } else {
-      // Simulación de respuesta cuando el webhook de prueba falla o no existe
-      console.warn("Error en la conexión con el Webhook. Generando respuesta simulada para pruebas:", error.message);
-      
-      const respuestaSimulada = obtenerRespuestaSimulada(mensaje);
-      agregarMensajeAlDOM(respuestaSimulada, 'bot');
-    }
-  } finally {
-    // Aplicar temporizador de espera (cooldown) antes de rehabilitar
+    // Pausa mínima de 1,5 segundos antes de rehabilitar
     setTimeout(() => {
       bloquearInterfaz(false);
     }, COOLDOWN_TIME);
@@ -100,7 +153,76 @@ async function enviarMensaje() {
 }
 
 /**
- * Agrega burbujas de mensaje a la zona de chat
+ * Analiza y limpia la respuesta de Make tolerando Markdown o saltos de línea sin escapar
+ */
+function procesarRespuestaMake(texto) {
+  if (!texto) {
+    return '(respuesta vacía)';
+  }
+
+  // Quitar posibles envoltorios de bloque de código Markdown
+  let limpio = texto
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
+
+  if (!limpio) {
+    return '(respuesta vacía)';
+  }
+
+  const camposPrioridad = ['response', 'respuesta', 'message', 'mensaje'];
+  let datos = null;
+  let parseadoOk = false;
+
+  try {
+    datos = JSON.parse(limpio);
+    parseadoOk = true;
+  } catch (e) {
+    // Si parece un objeto JSON, intentar reparar saltos de línea crudos dentro de strings
+    if (limpio.startsWith('{') && limpio.endsWith('}')) {
+      try {
+        const reparado = limpio.replace(/"((?:[^"\\]|\\.)*)"/gs, (match, contenido) => {
+          const escapado = contenido
+            .replace(/\r\n/g, '\\n')
+            .replace(/\n/g, '\\n')
+            .replace(/\r/g, '\\r');
+          return `"${escapado}"`;
+        });
+        datos = JSON.parse(reparado);
+        parseadoOk = true;
+      } catch (e2) {
+        // Extraer por expresión regular como último recurso
+        for (const campo of camposPrioridad) {
+          const regex = new RegExp(`"${campo}"\\s*:\\s*"([\\s\\S]*?)"\\s*(?:,|\\})`, 'i');
+          const coincidencia = limpio.match(regex);
+          if (coincidencia && coincidencia[1].trim()) {
+            return coincidencia[1].replace(/\\n/g, '\n').replace(/\\"/g, '"').trim();
+          }
+        }
+      }
+    }
+  }
+
+  // Si se logró analizar el JSON
+  if (parseadoOk) {
+    if (datos !== null && typeof datos === 'object' && !Array.isArray(datos)) {
+      for (const campo of camposPrioridad) {
+        if (typeof datos[campo] === 'string' && datos[campo].trim() !== '') {
+          return datos[campo];
+        }
+      }
+      return 'Make respondió, pero sin el campo response';
+    }
+    // Si es número, booleano, null, array o string suelto entre comillas
+    return limpio;
+  }
+
+  // Texto plano real
+  return limpio;
+}
+
+/**
+ * Agrega burbujas de mensaje a la zona de chat usando textContent
  */
 function agregarMensajeAlDOM(texto, tipo) {
   const msgDiv = document.createElement('div');
@@ -117,11 +239,11 @@ function agregarMensajeAlDOM(texto, tipo) {
 function mostrarIndicadorCarga() {
   const loadingDiv = document.createElement('div');
   loadingDiv.classList.add('message', 'message-bot', 'loading-indicator');
-  loadingDiv.innerHTML = `
-    <div class="dot"></div>
-    <div class="dot"></div>
-    <div class="dot"></div>
-  `;
+  for (let i = 0; i < 3; i++) {
+    const dot = document.createElement('div');
+    dot.classList.add('dot');
+    loadingDiv.appendChild(dot);
+  }
   zonaDeChat.appendChild(loadingDiv);
   hacerScrollAlFinal();
   return loadingDiv;
@@ -149,17 +271,4 @@ function bloquearInterfaz(bloquear) {
   if (!bloquear) {
     userInput.focus();
   }
-}
-
-/**
- * Función fallback para simular respuestas médicas mientras se integra el webhook real
- */
-function obtenerRespuestaSimulada(consulta) {
-  const texto = consulta.toLowerCase();
-  if (texto.includes('turno') || texto.includes('cita')) {
-    return "Para solicitar un turno, necesitás presentar tu DNI y carnet de cobertura en recepción, o realizarlo desde el portal web en la sección 'Mis Turnos'.";
-  } else if (texto.includes('receta') || texto.includes('medicamento')) {
-    return "Las recetas digitales tienen una validez de 30 días desde su fecha de emisión. Podés consultarlas en la app oficial.";
-  }
-  return `He recibido tu consulta sobre: "${consulta}". Recordá que para trámites presenciales el horario de atención es de 08:00 a 16:00 hs.`;
 }
