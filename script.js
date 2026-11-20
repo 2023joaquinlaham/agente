@@ -61,15 +61,31 @@ chatForm.addEventListener('submit', (e) => {
 });
 
 /**
- * Verifica si la URL del webhook está configurada correctamente
+ * Detecta y devuelve la URL del webhook desde config.js
  */
-function webhookConfigurado() {
-  if (typeof WEBHOOK_URL === 'undefined') return false;
-  const url = String(WEBHOOK_URL).trim();
-  if (!url || url.includes('ACA VA') || url.includes('ejemplo-webhook-prueba')) {
-    return false;
+function obtenerUrlWebhook() {
+  // Buscar en variables globales comunes por si se modificó el nombre en config.js
+  const posiblesVariables = [
+    typeof WEBHOOK_URL !== 'undefined' ? WEBHOOK_URL : null,
+    typeof webhookUrl !== 'undefined' ? webhookUrl : null,
+    typeof URL_WEBHOOK !== 'undefined' ? URL_WEBHOOK : null,
+    typeof MAKE_WEBHOOK_URL !== 'undefined' ? MAKE_WEBHOOK_URL : null,
+    window.WEBHOOK_URL,
+    window.webhookUrl
+  ];
+
+  for (const valor of posiblesVariables) {
+    if (typeof valor === 'string') {
+      const urlLimpia = valor.trim();
+      const esPlaceholder = urlLimpia.includes('ACA VA') || urlLimpia.includes('ejemplo-webhook-prueba');
+      
+      if (urlLimpia.startsWith('http') && !esPlaceholder) {
+        return urlLimpia;
+      }
+    }
   }
-  return true;
+
+  return null;
 }
 
 /**
@@ -86,9 +102,10 @@ async function enviarMensaje() {
     return;
   }
 
-  // Verificar si falta configurar la URL del webhook
-  if (!webhookConfigurado()) {
-    agregarMensajeAlDOM('Falta pegar la URL de tu webhook en config.js', 'error');
+  // Obtener y validar la URL desde config.js
+  const urlDestino = obtenerUrlWebhook();
+  if (!urlDestino) {
+    agregarMensajeAlDOM('No se encontró una URL válida en config.js. Revisá que la constante sea const WEBHOOK_URL = "https://..." y recargá la página con Ctrl + F5.', 'error');
     return;
   }
 
@@ -113,7 +130,7 @@ async function enviarMensaje() {
       fecha: new Date().toISOString()
     };
 
-    const response = await fetch(WEBHOOK_URL, {
+    const response = await fetch(urlDestino, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json'
